@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pacman · tev1</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --wall: #e6e5e1;
+    --ink: #1f1f1f;
+    --muted: #8a8a8a;
+    --key: #0b8a63;
+    --num: #0b8a63;
+    --punct: #444;
+    --btn: #f2f1ee;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+  }
+  .wrap { display: flex; gap: 40px; padding: 24px; align-items: flex-start; flex-wrap: wrap; }
+  canvas { display: block; max-width: 100%; height: auto; }
+  .panel { flex: 1; min-width: 320px; max-width: 520px; }
+  .status { color: var(--muted); font-size: 18px; margin: 16px 0 24px; }
+  pre.json {
+    font: 22px/1.6 ui-monospace, "SF Mono", Menlo, monospace;
+    margin: 0; white-space: pre; color: var(--punct); min-height: 560px;
+  }
+  .k { color: var(--key); } .s { color: var(--key); } .n { color: var(--num); }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 24px; }
+  button, input, select {
+    font: inherit; border: 0; background: var(--btn); color: var(--ink);
+    padding: 7px 12px; border-radius: 6px;
+  }
+  button { cursor: pointer; }
+  button:hover { filter: brightness(0.95); }
+  input { width: 90px; }
+  .stats { margin-top: 14px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  details { margin-top: 14px; color: var(--muted); }
+  details pre { white-space: pre-wrap; font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="c"></canvas>
+  <div class="panel">
+    <div class="status" id="status">Press Start</div>
+    <pre class="json" id="json"></pre>
+    <div class="controls">
+      <button id="start">Start</button>
+      <button id="step">Step</button>
+      <button id="reset">Reset</button>
+      <label>model <input id="model" value="tev1"></label>
+      <label>speed
+        <select id="speed">
+          <option value="400">slow</option>
+          <option value="160" selected>normal</option>
+          <option value="60">fast</option>
+        </select>
+      </label>
+    </div>
+    <div class="stats" id="stats"></div>
+    <details>
+      <summary>State sent to the model</summary>
+      <pre id="state"></pre>
+    </details>
+  </div>
+</div>
+
+<script>
+// ---------------------------------------------------------------- maze
+// # wall, . pellet, o power pellet, - ghost door, space = empty floor
+const MAP = [
+  "###################",
+  "#........#........#",
+  "#o##.###.#.###.##o#",
+  "#.................#",
+  "#.##.#.#####.#.##.#",
+  "#....#...#...#....#",
+  "####.### # ###.####",
+  "   #.#       #.#   ",
+  "####.# ##-## #.####",
+  "    .  #   #  .    ",
+  "####.# ##### #.####",
+  "   #.#       #.#   ",
+  "####.# ##### #.####",
+  "#........#........#",
+  "#.##.###.#.###.##.#",
+  "#o.#...........#.o#",
+  "##.#.#.#####.#.#.##",
+  "#....#...#...#....#",
+  "#.######.#.######.#",
+  "#.................#",
+  "###################",
+];
+const W = MAP[0].length, H = MAP.length, CS = 33;
+const DIRS = { up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0] };
+const OPP = { up: "down", down: "up", left: "right", right: "left" };
+const FRIGHT_TURNS = 30;
+
+const cv = document.getElementById("c");
+const dpr = window.devicePixelRatio || 1;
+cv.width = W * CS * dpr; cv.height = H * CS * dpr;
+cv.style.width = W * CS + "px";
+const ctx = cv.getContext("2d");
+ctx.scale(dpr, dpr);
+
+const $ = id => document.getElementById(id);
+const wrap = x => (x + W) % W;
+const isWall = (x, y, ghost = false) => {
+  if (y < 0 || y >= H) return true;
+  const c = MAP[y][wrap(x)];
+  return c === "#" || (c === "-" && !ghost);
+};
+
+let G; // game state
+function reset() {
+  const pellets = new Map();
+  MAP.forEach((row, y) => [...row].forEach((c, x) => {
+    if (c === "." || c === "o") pellets.set(x + "," + y, c);
+  }));
+  G = {
+    pellets, score: 0, turn: 0, over: false, won: false, fright: 0,
+    pac: { x: 9, y: 15, px: 9, py: 15, dir: "left" },
+    ghosts: [
+      { name: "Pinky", color: "#e07fb4", x: 9, y: 7, px: 9, py: 7, dir: "left", home: [9, 7], target: "ahead" },
+      { name: "Clyde", color: "#e8894f", x: 9, y: 11, px: 9, py: 11, dir: "right", home: [9, 11], target: "chase" },
+    ],
+    last: null, lastState: "", decisions: 0,
+  };
+  G.pellets.delete("9,15");
+  $("json").innerHTML = "";
+  $("state").textContent = "";
+  setStatus("Press Start");
+  updateStats();
+}
+
+// ---------------------------------------------------------------- helpers
+function neighbors(x, y, ghost = false) {
+  return Object.entries(DIRS)
+    .map(([d, [dx, dy]]) => ({ d, x: wrap(x + dx), y: y + dy }))
+    .filter(n => !isWall(n.x, n.y, ghost));
+}
+
+// BFS from (sx,sy) with `blocked` tile excluded; returns dist map
+function bfs(sx, sy, blocked) {
+  const dist = new Map([[sx + "," + sy, 0]]);
+  const q = [[sx, sy]];
+  while (q.length) {
+    const [x, y] = q.shift();
+    const d = dist.get(x + "," + y);
+    for (const n of neighbors(x, y)) {
+      const k = n.x + "," + n.y;
+      if (k === blocked || dist.has(k)) continue;
+      dist.set(k, d + 1);
+      q.push([n.x, n.y]);
+    }
+  }
+  return dist;
+}
+
+// What lies in each direction from Pacman's tile
+function describeOptions() {
+  const { pac } = G;
+  const here = pac.x + "," + pac.y;
+  return neighbors(pac.x, pac.y).map(n => {
+    const dist = bfs(n.x, n.y, here);
+    let pellet = Infinity, power = Infinity;
+    for (const [k, c] of G.pellets) {
+      const d = dist.get(k);
+      if (d === undefined) continue;
+      pellet = Math.min(pellet, d + 1);
+      if (c === "o") power = Math.min(power, d + 1);
+    }
+    const ghosts = G.ghosts.map(g => ({ g, d: (dist.get(g.x + "," + g.y) ?? Infinity) + 1 }));
+    return { dir: n.d, pellet, power, ghosts };
+  });
+}
+
+function stateText(opts) {
+  const lines = [
+    `You are Pacman in a maze. Goal: eat every pellet without being caught by a ghost.`,
+    `Score ${G.score}. Pellets left: ${G.pellets.size}. Currently moving ${G.pac.dir}.`,
+    G.fright > 0
+      ? `Power mode active for ${G.fright} more turns: ghosts are frightened and can be eaten for bonus points.`
+      : `Ghosts are dangerous: moving toward a nearby ghost means losing.`,
+    ``,
+    `Options:`,
+  ];
+  for (const o of opts) {
+    const parts = [];
+    parts.push(o.pellet === Infinity ? "no pellets reachable this way" :
+      o.pellet === 1 ? "a pellet right next to Pacman" : `nearest pellet ${o.pellet} steps away`);
+    if (o.power !== Infinity && o.power <= 8) parts.push(`power pellet ${o.power} steps away`);
+    for (const { g, d } of o.ghosts) {
+      if (d > 8) continue;
+      if (G.fright > 0) parts.push(`frightened ghost ${g.name} ${d} steps away (edible)`);
+      else parts.push(`ghost ${g.name} only ${d} steps away${d <= 3 ? " — DANGER, deadly" : ""}`);
+    }
+    if (!o.ghosts.some(({ d }) => d <= 8)) parts.push("no ghosts nearby, safe");
+    if (o.dir === OPP[G.pac.dir]) parts.push("turns back");
+    lines.push(`- ${o.dir}: ${parts.join("; ")}.`);
+  }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------- model
+async function askModel(opts) {
+  const state = stateText(opts);
+  G.lastState = state;
+  $("state").textContent = state;
+  const criteria = Object.fromEntries(opts.map(o => [o.dir, null]));
+  const body = {
+    model: $("model").value.trim() || "tev1",
+    state,
+    questions: {
+      move: {
+        type: "choice",
+        instructions: "Which direction should Pacman move next to eat pellets and stay away from dangerous ghosts?",
+        criteria,
+      },
+    },
+  };
+  const res = await fetch("http://localhost:11434/v1/systemone", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+// ---------------------------------------------------------------- ghosts
+function ghostTarget(g) {
+  const p = G.pac;
+  if (G.fright > 0) return [g.x * 2 - p.x, g.y * 2 - p.y]; // flee
+  if (g.target === "ahead") {
+    const [dx, dy] = DIRS[p.dir];
+    return [p.x + dx * 4, p.y + dy * 4];
+  }
+  // Clyde: chase when far, wander to corner when close
+  const far = Math.hypot(g.x - p.x, g.y - p.y) > 6;
+  return far ? [p.x, p.y] : [0, H];
+}
+
+function moveGhost(g) {
+  let opts = neighbors(g.x, g.y, true).filter(n => n.d !== OPP[g.dir]);
+  if (!opts.length) opts = neighbors(g.x, g.y, true);
+  let pick;
+  if (Math.random() < 0.15) pick = opts[Math.floor(Math.random() * opts.length)];
+  else {
+    const [tx, ty] = ghostTarget(g);
+    pick = opts.reduce((a, b) =>
+      Math.hypot(a.x - tx, a.y - ty) <= Math.hypot(b.x - tx, b.y - ty) ? a : b);
+  }
+  g.px = g.x; g.py = g.y;
+  g.x = pick.x; g.y = pick.y; g.dir = pick.d;
+}
+
+function checkCollisions(swapCheck) {
+  const p = G.pac;
+  for (const g of G.ghosts) {
+    const same = g.x === p.x && g.y === p.y;
+    const swapped = swapCheck && g.x === p.px && g.y === p.py && g.px === p.x && g.py === p.y;
+    if (!same && !swapped) continue;
+    if (G.fright > 0) {
+      G.score += 200;
+      [g.x, g.y] = g.home; g.px = g.x; g.py = g.y;
+    } else {
+      G.over = true;
+    }
+  }
+}
+
+// ---------------------------------------------------------------- turn
+let running = false, busy = false, animStart = 0;
+
+async function turn() {
+  if (G.over || busy) return;
+  busy = true;
+  try {
+    const opts = describeOptions();
+    let dir;
+    if (opts.length === 1) {
+      dir = opts[0].dir;
+    } else {
+      setStatus("Thinking…");
+      const r = await askModel(opts);
+      G.last = r; G.decisions++;
+      renderJSON(r);
+      dir = r.answers?.move?.choice;
+      if (!DIRS[dir] || !opts.some(o => o.dir === dir)) dir = opts[0].dir;
+    }
+    const p = G.pac;
+    const [dx, dy] = DIRS[dir];
+    p.px = p.x; p.py = p.y;
+    p.x = wrap(p.x + dx); p.y += dy; p.dir = dir;
+
+    const k = p.x + "," + p.y;
+    const c = G.pellets.get(k);
+    if (c) {
+      G.pellets.delete(k);
+      G.score += c === "o" ? 50 : 10;
+      if (c === "o") G.fright = FRIGHT_TURNS;
+    }
+    checkCollisions(false);
+
+    G.turn++;
+    // ghosts are a bit slower than Pacman (skip every 4th turn), slower still when frightened
+    const skip = G.fright > 0 ? G.turn % 2 === 0 : G.turn % 4 === 0;
+    for (const g of G.ghosts) {
+      if (G.over) break;
+      if (skip) { g.px = g.x; g.py = g.y; continue; }
+      moveGhost(g);
+    }
+    if (!G.over) checkCollisions(true);
+    if (G.fright > 0) G.fright--;
+
+    if (!G.pellets.size) { G.over = true; G.won = true; }
+    animStart = performance.now();
+    setStatus(G.over ? (G.won ? "You win" : "Game over") : running ? "Playing" : "Paused");
+    if (G.over) setRunning(false);
+  } catch (e) {
+    setRunning(false);
+    setStatus("Error — is Ollama running?");
+    $("json").textContent = String(e);
+  } finally {
+    busy = false;
+    updateStats();
+  }
+}
+
+async function loop() {
+  while (running && !G.over) {
+    const t0 = performance.now();
+    await turn();
+    const wait = +$("speed").value - (performance.now() - t0);
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  }
+}
+
+function setRunning(v) {
+  running = v;
+  $("start").textContent = v ? "Pause" : "Start";
+  if (v) { setStatus("Playing"); loop(); }
+}
+
+// ---------------------------------------------------------------- UI
+function setStatus(s) { $("status").textContent = s; }
+function updateStats() {
+  $("stats").textContent =
+    `score ${G.score} · pellets left ${G.pellets.size} · turn ${G.turn} · model calls ${G.decisions}` +
+    (G.fright > 0 ? ` · power ${G.fright}` : "");
+}
+
+function renderJSON(r) {
+  const view = { answers: r.answers };
+  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const txt = JSON.stringify(view, (k, v) => typeof v === "number" ? +v.toFixed(2) : v, 2)
+    .replace(/: (-?\d+(\.\d+)?)/g, (m, n) => ": " + Number(n).toFixed(2));
+  $("json").innerHTML = esc(txt)
+    .replace(/"([^"]+)":/g, '<span class="k">"$1"</span>:')
+    .replace(/: "([^"]*)"/g, ': <span class="s">"$1"</span>')
+    .replace(/: (-?\d+\.\d+)/g, ': <span class="n">$1</span>');
+}
+
+$("start").onclick = () => { if (G.over) reset(); setRunning(!running); };
+$("step").onclick = () => { if (!running) turn(); };
+$("reset").onclick = () => { setRunning(false); reset(); };
+
+// ---------------------------------------------------------------- render
+function lerpPos(o, t) {
+  let px = o.px;
+  if (Math.abs(o.x - o.px) > 1) px = o.x + (o.x > o.px ? 1 : -1); // tunnel wrap
+  return [(px + (o.x - px) * t) * CS + CS / 2, (o.py + (o.y - o.py) * t) * CS + CS / 2];
+}
+
+function drawGhost(g, t) {
+  const [cx, cy] = lerpPos(g, t);
+  const r = CS * 0.4;
+  const frightened = G.fright > 0;
+  ctx.fillStyle = frightened ? (G.fright < 6 && G.fright % 2 ? "#ffffff" : "#5b6fd6") : g.color;
+  if (frightened && G.fright < 6 && G.fright % 2) { ctx.strokeStyle = "#5b6fd6"; }
+  ctx.beginPath();
+  ctx.arc(cx, cy - r * 0.15, r, Math.PI, 0);
+  const base = cy + r * 0.85, n = 3, w = (2 * r) / n;
+  ctx.lineTo(cx + r, base);
+  for (let i = 0; i < n; i++) {
+    const x0 = cx + r - i * w;
+    ctx.lineTo(x0 - w / 2, base - r * 0.25);
+    ctx.lineTo(x0 - w, base);
+  }
+  ctx.closePath();
+  ctx.fill();
+  // eyes
+  const [dx, dy] = DIRS[g.dir];
+  for (const s of [-1, 1]) {
+    const ex = cx + s * r * 0.38, ey = cy - r * 0.2;
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(ex, ey, r * 0.26, 0, 7); ctx.fill();
+    ctx.fillStyle = "#1d2a5c";
+    ctx.beginPath(); ctx.arc(ex + dx * r * 0.1, ey + dy * r * 0.1, r * 0.13, 0, 7); ctx.fill();
+  }
+}
+
+function drawPac(t, now) {
+  const p = G.pac;
+  const [cx, cy] = lerpPos(p, t);
+  const r = CS * 0.42;
+  const mouth = G.over && !G.won ? 0 : (Math.sin(now / 70) * 0.5 + 0.5) * 0.32 * Math.PI;
+  const ang = { right: 0, down: Math.PI / 2, left: Math.PI, up: -Math.PI / 2 }[p.dir];
+  ctx.fillStyle = "#e3b04b";
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, r, ang + mouth, ang + 2 * Math.PI - mouth);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function draw(now) {
+  const t = Math.min(1, (now - animStart) / Math.max(40, +$("speed").value * 0.8));
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, W * CS, H * CS);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const c = MAP[y][x];
+    if (c === "#") { ctx.fillStyle = "#e6e5e1"; ctx.fillRect(x * CS, y * CS, CS, CS); }
+    if (c === "-") { ctx.fillStyle = "#e6e5e1"; ctx.fillRect(x * CS, y * CS + CS * 0.4, CS, CS * 0.2); }
+  }
+  for (const [k, c] of G.pellets) {
+    const [x, y] = k.split(",").map(Number);
+    ctx.fillStyle = "#1f1f1f";
+    ctx.beginPath();
+    ctx.arc(x * CS + CS / 2, y * CS + CS / 2, c === "o" ? 6 : 2.6, 0, 7);
+    ctx.fill();
+  }
+  drawPac(t, now);
+  for (const g of G.ghosts) drawGhost(g, t);
+  requestAnimationFrame(draw);
+}
+
+reset();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
